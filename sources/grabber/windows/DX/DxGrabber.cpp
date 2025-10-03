@@ -919,16 +919,16 @@ void DxGrabber::captureFrame(DisplayHandle& display)
 			if (CHECK(status) && CHECK(_d3dContext->Map(display.d3dSourceTexture, 0, D3D11_MAP_READ, 0, &internalMap)))
 			{
 				bool useLut = !(_hardware && display.wideGamut);
+
 				if (_hdrToneMappingEnabled && !_lutBufferInit && useLut)
 				{
 					loadLutFile(PixelFormat::RGB24, true);
-					pleaseWaitForLut(false);
+					_lutBufferInit = (_lut.data() != nullptr);
+					_pleaseWaitForLut = false;
 				}
-				else
-				{
-					processSystemFrameBGRA((uint8_t*)internalMap.pData, (int)internalMap.RowPitch, _hdrToneMappingEnabled && useLut);
-				}
-				_d3dContext->Unmap(display.d3dSourceTexture, 0);
+
+				processSystemFrameBGRA((uint8_t*)internalMap.pData, (int)internalMap.RowPitch,
+					_hdrToneMappingEnabled && _lutBufferInit && useLut);
 			}
 			else
 			{
@@ -1043,22 +1043,23 @@ int DxGrabber::captureFrame(DisplayHandle& display, Image<ColorRgb>& image)
 					sourceRowPitch = processingWidth * 4;
 				}
 
-				bool useLut = !(_hardware) && display.wideGamut;
+				bool useLut = !(_hardware && display.wideGamut);
 				int targetSizeX, targetSizeY;
 				int divide = getTargetSystemFrameDimension(processingWidth, processingHeight, targetSizeX, targetSizeY);
 
 				image = Image<ColorRgb>(targetSizeX, targetSizeY);
 
-				if (_hdrToneMappingEnabled && !lutBufferInit)
+				if (_hdrToneMappingEnabled && !_lutBufferInit)
 				{
-					useLut = loadLutFile(PixelFormat::RGB24, true);
+					loadLutFile(PixelFormat::RGB24, true);
+					_lutBufferInit = (_lut.data() != nullptr);
 					_pleaseWaitForLut = false;
 				}
 
 				FrameDecoder::processSystemImageBGRA(image, targetSizeX, targetSizeY, 0, 0,
 					sourceData,
 					processingWidth, processingHeight, divide,
-					(_hdrToneMappingEnabled == 0 || !lutBufferInit || !useLut) ? nullptr : _lut.data(),
+					(_hdrToneMappingEnabled == 0 || !_lutBufferInit || !useLut) ? nullptr : _lut.data(),
 					sourceRowPitch);
 
 				result = 1;
@@ -1070,7 +1071,8 @@ int DxGrabber::captureFrame(DisplayHandle& display, Image<ColorRgb>& image)
 				Error(_log, "Cannot copy or map texture. Reason: %i. Restarting...", status);
 				_dxRestartNow = true;
 			}
-			SafeRelease(texDesktop);
+			SafeRelease(&texDesktop);
+			SafeRelease(&resourceDesktop);
 		}
 		else
 		{
@@ -1132,7 +1134,7 @@ void DxGrabber::cacheHandler(const Image<ColorRgb>& image)
 void DxGrabber::processRotatedFrame(DisplayHandle& display, uint8_t* frameData, int rowPitch) {
 	if (!display.needsRotationFix) {
 		// Обычная обработка для неповернутых мониторов
-		processSystemFrameBGRA(frameData, rowPitch, _hdrToneMappingEnabled && useLut);
+		processSystemFrameBGRA(frameData, rowPitch, _hdrToneMappingEnabled && _lutBufferInit);
 		return;
 	}
 
@@ -1158,7 +1160,7 @@ void DxGrabber::processRotatedFrame(DisplayHandle& display, uint8_t* frameData, 
 		break;
 	}
 
-	processSystemFrameBGRA(rotatedBuffer.data(), targetWidth * 4, _hdrToneMappingEnabled && useLut);
+	processSystemFrameBGRA(rotatedBuffer.data(), targetWidth * 4, _hdrToneMappingEnabled && _lutBufferInit);
 }
 
 void DxGrabber::rotateImage90(uint8_t* source, uint8_t* dest, int width, int height, int sourceRowPitch) {
