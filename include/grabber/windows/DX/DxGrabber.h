@@ -140,7 +140,8 @@ private:
 	void uninit() override;
 
 	bool initDirectX(QString selectedDeviceName);
-
+	bool _lutBufferInit = false;
+	bool _pleaseWaitForLut = false;
 	bool initShaders(DisplayHandle& display);
 	HRESULT deepScaledCopy(DisplayHandle& display, ID3D11Texture2D* source);
 
