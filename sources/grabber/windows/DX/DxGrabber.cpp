@@ -141,11 +141,11 @@ void DxGrabber::uninit()
 	}
 }
 
-void DxGrabber::newWorkerFrameHandler(unsigned int /*workerIndex*/, Image<ColorRgb> /*image*/, quint64 /*sourceCount*/, qint64 /*_frameBegin*/)
+void DxGrabber::newWorkerFrameHandler(unsigned int workerIndex, Image<ColorRgb> image, quint64 sourceCount, qint64 _frameBegin)
 {
 };
 
-void DxGrabber::newWorkerFrameErrorHandler(unsigned int /*workerIndex*/, QString /*error*/, quint64 /*sourceCount*/)
+void DxGrabber::newWorkerFrameErrorHandler(unsigned int workerIndex, QString error, quint64 sourceCount)
 {
 };
 
@@ -217,7 +217,7 @@ void DxGrabber::getDevices()
 	enumerateDevices(false);
 }
 
-void DxGrabber::enumerateDevices(bool /*silent*/)
+void DxGrabber::enumerateDevices(bool silent)
 {
 	IDXGIFactory1* pFactory = NULL;
 
@@ -424,11 +424,33 @@ bool DxGrabber::initDirectX(QString selectedDeviceName)
 						{
 							CLEAR(display->surfaceProperties);
 							display->d3dDuplicate->GetDesc(&display->surfaceProperties);
-
 							Info(_log, "Surface format: %i", display->surfaceProperties.ModeDesc.Format);
 
-							int targetSizeX = display->surfaceProperties.ModeDesc.Width, targetSizeY = display->surfaceProperties.ModeDesc.Height;
+							// Получаем реальные размеры дисплея из DXGI_OUTPUT_DESC
+							DXGI_OUTPUT_DESC outputDesc;
+							pOutput->GetDesc(&outputDesc);
 
+							display->realDisplayWidth = outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left;
+							display->realDisplayHeight = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
+							display->rotation = outputDesc.Rotation;
+
+							// Определяем, нужно ли исправление для вертикального режима
+							display->needsRotationFix = (display->rotation == DXGI_MODE_ROTATION_ROTATE90 ||
+								display->rotation == DXGI_MODE_ROTATION_ROTATE270);
+
+							int targetSizeX = display->surfaceProperties.ModeDesc.Width;
+							int targetSizeY = display->surfaceProperties.ModeDesc.Height;
+
+							// Для вертикальных мониторов используем реальные размеры дисплея, а не размеры поверхности
+							if (display->needsRotationFix) {
+								targetSizeX = display->realDisplayWidth;
+								targetSizeY = display->realDisplayHeight;
+
+								Info(_log, "Vertical monitor detected. Real size: %dx%d, Surface size: %dx%d, Rotation: %d",
+									display->realDisplayWidth, display->realDisplayHeight,
+									display->surfaceProperties.ModeDesc.Width, display->surfaceProperties.ModeDesc.Height,
+									display->rotation);
+							}
 							if (display->surfaceProperties.Rotation == DXGI_MODE_ROTATION::DXGI_MODE_ROTATION_ROTATE90 ||
 								display->surfaceProperties.Rotation == DXGI_MODE_ROTATION::DXGI_MODE_ROTATION_ROTATE270)
 							{
@@ -794,10 +816,10 @@ void DxGrabber::grabFrame()
 				images.push_back(std::pair<int, Image<ColorRgb>>(width, image));
 			}
 
-			int targetSizeX = 0, targetSizeY = 0;
-			getTargetSystemFrameDimension(display->actualWidth, display->actualHeight, targetSizeX, targetSizeY);
+			int targetSizeX = image.width();
+			int targetSizeY = image.height();
 
-			if (_reorderDisplays > 0 && result == 0)
+			if (_reorderDisplays >= 0)
 			{
 				images.push_back(std::pair<int, Image<ColorRgb>>(width, Image<ColorRgb>(targetSizeX, 1)));
 			}
@@ -806,7 +828,7 @@ void DxGrabber::grabFrame()
 			height = std::max(targetSizeY, height);
 		}
 
-		if (useCache && (static_cast<int>(_cacheImage.width()) != width || static_cast<int>(_cacheImage.height()) != height))
+		if (useCache && (_cacheImage.width() != width || _cacheImage.height() != height))
 		{
 			Warning(_log, "Invalid cached image size. Cached: %i x %i vs new: %i x %i", _cacheImage.width(), _cacheImage.height(), width, height);
 			return;
@@ -963,26 +985,22 @@ void DxGrabber::captureFrame(DisplayHandle& display)
 int DxGrabber::captureFrame(DisplayHandle& display, Image<ColorRgb>& image)
 {
 	int result = -1;
-	DXGI_OUTDUPL_FRAME_INFO infoFrame{};
+	DXGI_OUTDUPL_FRAME_INFO infoFrame;
 	IDXGIResource* resourceDesktop = nullptr;
-
 	auto status = display.d3dDuplicate->AcquireNextFrame(0, &infoFrame, &resourceDesktop);
 
 	if (CHECK(status))
 	{
-		D3D11_MAPPED_SUBRESOURCE internalMap{};
+		D3D11_MAPPED_SUBRESOURCE internalMap;
 		ID3D11Texture2D* texDesktop = nullptr;
-
 		CLEAR(internalMap);
 
 		status = resourceDesktop->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&texDesktop);
-
 		if (CHECK(status) && texDesktop != nullptr)
 		{
 			if (_hardware)
 			{
 				status = deepScaledCopy(display, texDesktop);
-
 				if (!CHECK(status))
 				{
 					Error(_log, "DeepScaledCopy failed. Reason: %i", status);
@@ -995,24 +1013,56 @@ int DxGrabber::captureFrame(DisplayHandle& display, Image<ColorRgb>& image)
 
 			if (CHECK(status) && CHECK(_d3dContext->Map(display.d3dSourceTexture, 0, D3D11_MAP_READ, 0, &internalMap)))
 			{
-				int lineSize = (int)internalMap.RowPitch;
-				bool useLut = !(_hardware && display.wideGamut);
+				uint8_t* sourceData = reinterpret_cast<uint8_t*>(internalMap.pData);
+				int sourceRowPitch = internalMap.RowPitch;
+				int processingWidth = display.actualWidth;
+				int processingHeight = display.actualHeight;
+
+				std::vector<uint8_t> rotatedBuffer;
+
+				if (display.needsRotationFix)
+				{
+					int sourceWidth = display.surfaceProperties.ModeDesc.Width;
+					int sourceHeight = display.surfaceProperties.ModeDesc.Height;
+
+					processingWidth = display.realDisplayWidth;
+					processingHeight = display.realDisplayHeight;
+
+					rotatedBuffer.resize(processingWidth * processingHeight * 4);
+
+					switch (display.rotation) {
+					case DXGI_MODE_ROTATION_ROTATE90:
+						rotateImage90(sourceData, rotatedBuffer.data(), sourceWidth, sourceHeight, sourceRowPitch);
+						break;
+					case DXGI_MODE_ROTATION_ROTATE270:
+						rotateImage270(sourceData, rotatedBuffer.data(), sourceWidth, sourceHeight, sourceRowPitch);
+						break;
+					}
+
+					sourceData = rotatedBuffer.data();
+					sourceRowPitch = processingWidth * 4;
+				}
+
+				bool useLut = !(_hardware) && display.wideGamut;
 				int targetSizeX, targetSizeY;
-				int divide = getTargetSystemFrameDimension(display.actualWidth, display.actualHeight, targetSizeX, targetSizeY);
+				int divide = getTargetSystemFrameDimension(processingWidth, processingHeight, targetSizeX, targetSizeY);
 
 				image = Image<ColorRgb>(targetSizeX, targetSizeY);
 
-				if (_hdrToneMappingEnabled && !_lutBufferInit && useLut)
+				if (_hdrToneMappingEnabled && !lutBufferInit)
 				{
-					loadLutFile(PixelFormat::RGB24, true);
-					pleaseWaitForLut(false);
-				}
-				else
-				{
-					FrameDecoder::processSystemImageBGRA(image, targetSizeX, targetSizeY, 0, 0, (uint8_t*)internalMap.pData, display.actualWidth, display.actualHeight, divide, (_hdrToneMappingEnabled == 0 || !_lutBufferInit || !useLut) ? nullptr : _lut.data(), lineSize);
+					useLut = loadLutFile(PixelFormat::RGB24, true);
+					_pleaseWaitForLut = false;
 				}
 
+				FrameDecoder::processSystemImageBGRA(image, targetSizeX, targetSizeY, 0, 0,
+					sourceData,
+					processingWidth, processingHeight, divide,
+					(_hdrToneMappingEnabled == 0 || !lutBufferInit || !useLut) ? nullptr : _lut.data(),
+					sourceRowPitch);
+
 				result = 1;
+
 				_d3dContext->Unmap(display.d3dSourceTexture, 0);
 			}
 			else
@@ -1020,27 +1070,26 @@ int DxGrabber::captureFrame(DisplayHandle& display, Image<ColorRgb>& image)
 				Error(_log, "Cannot copy or map texture. Reason: %i. Restarting...", status);
 				_dxRestartNow = true;
 			}
-
-			SafeRelease(&texDesktop);
+			SafeRelease(texDesktop);
 		}
-		else if (display.warningCounter > 0)
+		else
 		{
-			Error(_log, "ResourceDesktop->QueryInterface failed. Reason: %i", status);
-			display.warningCounter--;
+			if (display.warningCounter > 0)
+			{
+				Error(_log, "ResourceDesktop->QueryInterface failed. Reason: %i", status);
+				display.warningCounter--;
+			}
 		}
 	}
 	else if (status == DXGI_ERROR_WAIT_TIMEOUT)
 	{
 		if (display.warningCounter > 0)
 		{
-			Debug(_log, "AcquireNextFrame didn't return the frame. Just warning: the screen has not changed?");
+			Debug(_log, "AcquireNextFrame didn't return the frame. Just warning, the screen has not changed?");
 			display.warningCounter--;
 		}
-
 		if (_cacheImage.width() > 1)
-		{
 			result = 0;
-		}
 	}
 	else if (status == DXGI_ERROR_ACCESS_LOST)
 	{
@@ -1058,14 +1107,11 @@ int DxGrabber::captureFrame(DisplayHandle& display, Image<ColorRgb>& image)
 		display.warningCounter--;
 	}
 
-	SafeRelease(&resourceDesktop);
-
+	SafeRelease(resourceDesktop);
 	display.d3dDuplicate->ReleaseFrame();
 
 	if (_dxRestartNow)
-	{
 		uninit();
-	}
 
 	return result;
 }
@@ -1082,4 +1128,65 @@ void DxGrabber::setCropping(unsigned cropLeft, unsigned cropRight, unsigned crop
 void DxGrabber::cacheHandler(const Image<ColorRgb>& image)
 {
 	_cacheImage = image;
+}
+void DxGrabber::processRotatedFrame(DisplayHandle& display, uint8_t* frameData, int rowPitch) {
+	if (!display.needsRotationFix) {
+		// Обычная обработка для неповернутых мониторов
+		processSystemFrameBGRA(frameData, rowPitch, _hdrToneMappingEnabled && useLut);
+		return;
+	}
+
+	// Создаем временный буфер для поворота изображения
+	int sourceWidth = display.surfaceProperties.ModeDesc.Width;
+	int sourceHeight = display.surfaceProperties.ModeDesc.Height;
+	int targetWidth = display.realDisplayWidth;
+	int targetHeight = display.realDisplayHeight;
+
+	std::vector<uint8_t> rotatedBuffer(targetWidth * targetHeight * 4);
+
+	// Поворачиваем изображение в зависимости от типа поворота
+	switch (display.rotation) {
+	case DXGI_MODE_ROTATION_ROTATE90:
+		rotateImage90(frameData, rotatedBuffer.data(), sourceWidth, sourceHeight, rowPitch);
+		break;
+	case DXGI_MODE_ROTATION_ROTATE270:
+		rotateImage270(frameData, rotatedBuffer.data(), sourceWidth, sourceHeight, rowPitch);
+		break;
+	default:
+		// В качестве запасного варианта, если что-то пошло не так
+		memcpy(rotatedBuffer.data(), frameData, targetWidth * targetHeight * 4);
+		break;
+	}
+
+	processSystemFrameBGRA(rotatedBuffer.data(), targetWidth * 4, _hdrToneMappingEnabled && useLut);
+}
+
+void DxGrabber::rotateImage90(uint8_t* source, uint8_t* dest, int width, int height, int sourceRowPitch) {
+	for (int y = 0; y < height; y++) {
+		for (int x = 0; x < width; x++) {
+			int sourceIndex = y * sourceRowPitch + x * 4;
+			// Поворот на 90 градусов по часовой стрелке
+			int destIndex = ((width - 1 - x) * height + y) * 4;
+
+			dest[destIndex + 0] = source[sourceIndex + 0]; // B
+			dest[destIndex + 1] = source[sourceIndex + 1]; // G
+			dest[destIndex + 2] = source[sourceIndex + 2]; // R
+			dest[destIndex + 3] = source[sourceIndex + 3]; // A
+		}
+	}
+}
+
+void DxGrabber::rotateImage270(uint8_t* source, uint8_t* dest, int width, int height, int sourceRowPitch) {
+	for (int y = 0; y < height; y++) {
+		for (int x = 0; x < width; x++) {
+			int sourceIndex = y * sourceRowPitch + x * 4;
+			// Поворот на 270 градусов по часовой стрелке (или 90 против)
+			int destIndex = (x * height + (height - 1 - y)) * 4;
+
+			dest[destIndex + 0] = source[sourceIndex + 0]; // B
+			dest[destIndex + 1] = source[sourceIndex + 1]; // G
+			dest[destIndex + 2] = source[sourceIndex + 2]; // R
+			dest[destIndex + 3] = source[sourceIndex + 3]; // A
+		}
+	}
 }
