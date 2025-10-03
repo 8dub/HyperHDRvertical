@@ -56,7 +56,14 @@ struct DisplayHandle
 	IDXGIOutputDuplication* d3dDuplicate = nullptr;
 	ID3D11Texture2D* d3dSourceTexture = nullptr;
 	DXGI_OUTDUPL_DESC surfaceProperties{};
+	// ... существующие поля ...
+	
 
+	// Добавить новые поля:
+	int realDisplayWidth;      // Реальная ширина дисплея
+	int realDisplayHeight;     // Реальная высота дисплея
+	DXGI_MODE_ROTATION rotation; // Поворот дисплея
+	bool needsRotationFix;     // Нужно ли исправление поворота
 	DisplayHandle() = default;
 	DisplayHandle(const DisplayHandle&) = delete;
 	~DisplayHandle()
@@ -111,7 +118,9 @@ public slots:
 	void restart();
 
 private:
-
+	void processRotatedFrame(DisplayHandle& display, uint8_t* frameData, int rowPitch);
+	void rotateImage90(uint8_t* source, uint8_t* dest, int width, int height, int sourceRowPitch);
+	void rotateImage270(uint8_t* source, uint8_t* dest, int width, int height, int sourceRowPitch);
 	const QString MULTI_MONITOR = "MULTI-MONITOR";
 
 	void captureFrame(DisplayHandle& display);
